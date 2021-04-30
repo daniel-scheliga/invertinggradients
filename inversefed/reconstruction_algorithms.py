@@ -1,4 +1,5 @@
 """Mechanisms for image reconstruction from parameter gradients."""
+import logging
 
 import torch
 from collections import defaultdict, OrderedDict
@@ -23,7 +24,8 @@ DEFAULT_CONFIG = dict(signed=False,
                       init='randn',
                       filter='none',
                       lr_decay=True,
-                      scoring_choice='loss')
+                      scoring_choice='loss',
+                      early_stopper=None)
 
 def _label_to_onehot(target, num_classes=100):
     target = torch.unsqueeze(target, 1)
@@ -36,7 +38,7 @@ def _validate_config(config):
         if config.get(key) is None:
             config[key] = DEFAULT_CONFIG[key]
     for key in config.keys():
-        if DEFAULT_CONFIG.get(key) is None:
+        if DEFAULT_CONFIG.get(key) is None and key not in ['early_stopper']:
             raise ValueError(f'Deprecated key in config dict: {key}!')
     return config
 
@@ -59,12 +61,13 @@ class GradientReconstructor():
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
         self.iDLG = True
 
+        self.es = config['early_stopper']
+
     def reconstruct(self, input_data, labels, img_shape=(3, 32, 32), dryrun=False, eval=True, tol=None):
         """Reconstruct image from gradient."""
         start_time = time.time()
         if eval:
             self.model.eval()
-
 
         stats = defaultdict(list)
         x = self._init_images(img_shape)
@@ -99,6 +102,13 @@ class GradientReconstructor():
                     break
                 if dryrun:
                     break
+            while(not scores.isfinite().any()):
+                x = self._init_images(img_shape)
+                logging.info('All scores are infinite.. retrying...')
+                x_trial, labels = self._run_trial(x[0], input_data, labels, dryrun=dryrun)
+                # Finalize
+                scores[0] = self._score_trial(x_trial, input_data, labels)
+                x[0] = x_trial
         except KeyboardInterrupt:
             print('Trial procedure manually interruped.')
             pass
@@ -108,13 +118,15 @@ class GradientReconstructor():
             x_optimal, stats = self._average_trials(x, labels, input_data, stats)
         else:
             print('Choosing optimal result ...')
-            scores = scores[torch.isfinite(scores)]  # guard against NaN/-Inf scores?
+            inf_scores = torch.isfinite(scores)
+            scores = scores[inf_scores]  # guard against NaN/-Inf scores?
             optimal_index = torch.argmin(scores)
-            print(f'Optimal result score: {scores[optimal_index]:2.4f}')
+            logging.info(f'Optimal result score: {scores[optimal_index]:2.4f}')
             stats['opt'] = scores[optimal_index].item()
+            x = x[inf_scores]
             x_optimal = x[optimal_index]
 
-        print(f'Total time: {time.time()-start_time}.')
+        logging.info(f'Total time for reconstruction: {time.time()-start_time}.')
         return x_optimal.detach(), stats
 
     def _init_images(self, img_shape):
@@ -122,8 +134,22 @@ class GradientReconstructor():
             return torch.randn((self.config['restarts'], self.num_images, *img_shape), **self.setup)
         elif self.config['init'] == 'rand':
             return (torch.rand((self.config['restarts'], self.num_images, *img_shape), **self.setup) - 0.5) * 2
-        elif self.config['init'] == 'zeros':
+        elif self.config['init'] in ['zeros', 'black', 'dark']:
             return torch.zeros((self.config['restarts'], self.num_images, *img_shape), **self.setup)
+        elif self.config['init'] in ['ones', 'white', 'light']:
+            return torch.ones((self.config['restarts'], self.num_images, *img_shape), **self.setup)
+        elif self.config['init'] in ['R', 'red']:
+            imgs = torch.zeros((self.config['restarts'], self.num_images, *img_shape), **self.setup)
+            imgs[:,:,0,:,:] = 1
+            return imgs
+        elif self.config['init'] in ['G', 'green']:
+            imgs = torch.zeros((self.config['restarts'], self.num_images, *img_shape), **self.setup)
+            imgs[:,:,1,:,:] = 1
+            return imgs
+        elif self.config['init'] in ['B', 'blue']:
+            imgs = torch.zeros((self.config['restarts'], self.num_images, *img_shape), **self.setup)
+            imgs[:,:,2,:,:] = 1
+            return imgs
         else:
             raise ValueError()
 
@@ -171,7 +197,7 @@ class GradientReconstructor():
                         x_trial.data = torch.max(torch.min(x_trial, (1 - dm) / ds), -dm / ds)
 
                     if (iteration + 1 == max_iterations) or iteration % 500 == 0:
-                        print(f'It: {iteration}. Rec. loss: {rec_loss.item():2.4f}.')
+                        logging.info(f'It: {iteration}. Rec. loss: {rec_loss.item():2.4f}.')
 
                     if (iteration + 1) % 500 == 0:
                         if self.config['filter'] == 'none':
@@ -180,6 +206,13 @@ class GradientReconstructor():
                             x_trial.data = MedianPool2d(kernel_size=3, stride=1, padding=1, same=False)(x_trial)
                         else:
                             raise ValueError()
+                    
+                    #Stop earlier with reconstruction if our attack was already successful
+                    if self.es != None:
+                        self.es(rec_loss)
+                        if self.es.stop:
+                            logging.info(f'Early stopping the reconstruction since we had no improvement of {self.es.metric} for {self.es.patience} rounds. Reconstruction was stopped after {iteration+1} iterations')
+                            break
 
                 if dryrun:
                     break
@@ -194,7 +227,7 @@ class GradientReconstructor():
             optimizer.zero_grad()
             self.model.zero_grad()
             loss = self.loss_fn(self.model(x_trial), label)
-            gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=True)
+            gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=True, allow_unused=True)
             rec_loss = reconstruction_costs([gradient], input_gradient,
                                             cost_fn=self.config['cost_fn'], indices=self.config['indices'],
                                             weights=self.config['weights'])
@@ -212,7 +245,7 @@ class GradientReconstructor():
             self.model.zero_grad()
             x_trial.grad = None
             loss = self.loss_fn(self.model(x_trial), label)
-            gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=False)
+            gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=False, allow_unused=True)
             return reconstruction_costs([gradient], input_gradient,
                                         cost_fn=self.config['cost_fn'], indices=self.config['indices'],
                                         weights=self.config['weights'])
@@ -227,7 +260,7 @@ class GradientReconstructor():
             raise ValueError()
 
     def _average_trials(self, x, labels, input_data, stats):
-        print(f'Computing a combined result via {self.config["scoring_choice"]} ...')
+        logging.info(f'Computing a combined result via {self.config["scoring_choice"]} ...')
         if self.config['scoring_choice'] == 'pixelmedian':
             x_optimal, _ = x.median(dim=0, keepdims=False)
         elif self.config['scoring_choice'] == 'pixelmean':
@@ -237,12 +270,12 @@ class GradientReconstructor():
         if self.reconstruct_label:
             labels = self.model(x_optimal).softmax(dim=1)
         loss = self.loss_fn(self.model(x_optimal), labels)
-        gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=False)
+        gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=False, allow_unused=True)
         stats['opt'] = reconstruction_costs([gradient], input_data,
                                             cost_fn=self.config['cost_fn'],
                                             indices=self.config['indices'],
                                             weights=self.config['weights'])
-        print(f'Optimal result score: {stats["opt"]:2.4f}')
+        logging.info(f'Optimal result score: {stats["opt"]:2.4f}')
         return x_optimal, stats
 
 
@@ -309,7 +342,7 @@ def loss_steps(model, inputs, labels, loss_fn=torch.nn.CrossEntropyLoss(), lr=1e
             labels_ = labels[idx * batch_size:(idx + 1) * batch_size]
         loss = loss_fn(outputs, labels_).sum()
         grad = torch.autograd.grad(loss, patched_model.parameters.values(),
-                                   retain_graph=True, create_graph=True, only_inputs=True)
+                                   retain_graph=True, create_graph=True, only_inputs=True, allow_unused=True)
 
         patched_model.parameters = OrderedDict((name, param - lr * grad_part)
                                                for ((name, param), grad_part)

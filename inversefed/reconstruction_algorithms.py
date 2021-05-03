@@ -25,7 +25,9 @@ DEFAULT_CONFIG = dict(signed=False,
                       filter='none',
                       lr_decay=True,
                       scoring_choice='loss',
-                      early_stopper=None)
+                      loss_fn=torch.nn.CrossEntropyLoss(reduction='mean'),
+                      early_stopper=None
+                      )
 
 def _label_to_onehot(target, num_classes=100):
     target = torch.unsqueeze(target, 1)
@@ -58,7 +60,7 @@ class GradientReconstructor():
         if self.config['scoring_choice'] == 'inception':
             self.inception = InceptionScore(batch_size=1, setup=self.setup)
 
-        self.loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+        self.loss_fn = self.config['loss_fn']
         self.iDLG = True
 
         self.es = config['early_stopper']
@@ -418,7 +420,8 @@ def reconstruction_costs(gradients, input_gradient, cost_fn='l2', indices='def',
                                                                    input_gradient[i].flatten(),
                                                                    0, 1e-10) * weights[i]
         if cost_fn == 'sim':
-            costs = 1 + costs / pnorm[0].sqrt() / pnorm[1].sqrt()
+            eps = 1e-10
+            costs = 1 + costs / (pnorm[0].sqrt()+eps) / (pnorm[1].sqrt()+eps)
 
         # Accumulate final costs
         total_costs += costs

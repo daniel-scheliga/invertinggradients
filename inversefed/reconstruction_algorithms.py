@@ -2,6 +2,8 @@
 import logging
 
 import torch
+from torchvision.utils import save_image
+
 from collections import defaultdict, OrderedDict
 from inversefed.nn import MetaMonkey
 from .metrics import total_variation as TV
@@ -26,7 +28,8 @@ DEFAULT_CONFIG = dict(signed=False,
                       lr_decay=True,
                       scoring_choice='loss',
                       loss_fn=torch.nn.CrossEntropyLoss(reduction='mean'),
-                      early_stopper=None
+                      early_stopper=None,
+                      cpl_alpha=0.001
                       )
 
 def _label_to_onehot(target, num_classes=100):
@@ -208,13 +211,16 @@ class GradientReconstructor():
                             x_trial.data = MedianPool2d(kernel_size=3, stride=1, padding=1, same=False)(x_trial)
                         else:
                             raise ValueError()
-                    
+                    #save_image(x_trial*ds + dm, f'eye_img_data/rec_VB_2B{iteration:04d}.jpg')
                     #Stop earlier with reconstruction if our attack was already successful
                     if self.es != None:
                         self.es(rec_loss)
                         if self.es.stop:
                             logging.info(f'Early stopping the reconstruction since we had no improvement of {self.es.metric} for {self.es.patience} rounds. Reconstruction was stopped after {iteration+1} iterations')
                             break
+                    if rec_loss < 0.00001:
+                        logging.info(f'Early Stopping since the reconstruction loss is crazy low.')
+                        break
 
                 if dryrun:
                     break
@@ -228,11 +234,16 @@ class GradientReconstructor():
         def closure():
             optimizer.zero_grad()
             self.model.zero_grad()
-            loss = self.loss_fn(self.model(x_trial), label)
+            rec_label = self.model(x_trial)
+            loss = self.loss_fn(rec_label, label)
+            if self.config['cost_fn'] == 'CPL':
+                cpl_regadd = self.config['cpl_alpha'] * torch.dist(rec_label, label, 2)
+            else:
+                cpl_regadd = None
             gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=True, allow_unused=True)
             rec_loss = reconstruction_costs([gradient], input_gradient,
                                             cost_fn=self.config['cost_fn'], indices=self.config['indices'],
-                                            weights=self.config['weights'])
+                                            weights=self.config['weights'], cpl = cpl_regadd)
 
             if self.config['total_variation'] > 0:
                 rec_loss += self.config['total_variation'] * TV(x_trial)
@@ -246,11 +257,16 @@ class GradientReconstructor():
         if self.config['scoring_choice'] == 'loss':
             self.model.zero_grad()
             x_trial.grad = None
-            loss = self.loss_fn(self.model(x_trial), label)
+            rec_label = self.model(x_trial)
+            loss = self.loss_fn(rec_label, label)
+            if self.config['cost_fn'] == 'CPL':
+                cpl_regadd = 0.0001 * torch.dist(rec_label, label, 2)
+            else:
+                cpl_regadd = None
             gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=False, allow_unused=True)
             return reconstruction_costs([gradient], input_gradient,
                                         cost_fn=self.config['cost_fn'], indices=self.config['indices'],
-                                        weights=self.config['weights'])
+                                        weights=self.config['weights'], cpl = cpl_regadd)
         elif self.config['scoring_choice'] == 'tv':
             return TV(x_trial)
         elif self.config['scoring_choice'] == 'inception':
@@ -357,8 +373,10 @@ def loss_steps(model, inputs, labels, loss_fn=torch.nn.CrossEntropyLoss(), lr=1e
     return list(patched_model.parameters.values())
 
 
-def reconstruction_costs(gradients, input_gradient, cost_fn='l2', indices='def', weights='equal'):
+def reconstruction_costs(gradients, input_gradient, cost_fn='l2', indices='def', weights='equal', cpl=None):
     """Input gradient is given data."""
+    if cost_fn == 'CPL':
+        cost_fn='l2'
     if isinstance(indices, list):
         pass
     elif indices == 'def':
@@ -406,7 +424,10 @@ def reconstruction_costs(gradients, input_gradient, cost_fn='l2', indices='def',
             _, indices = torch.topk(torch.stack([p.norm().detach() for p in trial_gradient], dim=0), 4)
         for i in indices:
             if cost_fn == 'l2':
-                costs += ((trial_gradient[i] - input_gradient[i]).pow(2)).sum() * weights[i]
+                if cpl is None:
+                    costs += ((trial_gradient[i] - input_gradient[i]).pow(2)).sum() * weights[i]
+                else:
+                    costs += (((trial_gradient[i] - input_gradient[i]).pow(2)).sum() * weights[i]) + cpl
             elif cost_fn == 'l1':
                 costs += ((trial_gradient[i] - input_gradient[i]).abs()).sum() * weights[i]
             elif cost_fn == 'max':
